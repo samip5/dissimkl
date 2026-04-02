@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDE/editor files
+.idea/
+*.iml
+.vscode/
+
+# OS files
+.DS_Store
+
+# Temporary/swap files
+*.swp
+*.swo
+*~
+
+# Local environment overrides (keep .env.example tracked if you use one)
+.env
+.env.*
+
+# Note: keep Cargo.lock tracked for application/binary crates.
+
