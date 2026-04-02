@@ -2,7 +2,7 @@
 
 Discord Rich Presence for [Simkl](https://simkl.com) — shows what you are watching on Discord, sourced from Simkl playback history.
 
-Inspired by [discrakt](https://github.com/31/discrakt) (the Trakt equivalent).
+Inspired by [discrakt](https://github.com/afonsojramos/discrakt) (the Trakt equivalent).
 
 ---
 
