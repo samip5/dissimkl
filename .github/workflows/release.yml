@@ -24,10 +24,10 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
           - name: macos-aarch64
-            os: macos-latest
+            os: macos-26
             target: aarch64-apple-darwin
-          - name: macos-x86_64
-            os: macos-13
+          - name: macos-intel
+            os: macos-26-intel
             target: x86_64-apple-darwin
 
     steps:
