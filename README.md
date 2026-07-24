@@ -45,7 +45,15 @@ You need up to three Discord application IDs — one each for TV shows, anime, a
 4. Repeat for movies and anime if desired
 5. (Optional) Upload art assets named `simkl` in the **Rich Presence → Art Assets** section to use as a fallback icon
 
-### 3. Build and run
+### 3. Get dissimkl
+
+**Prebuilt binaries (recommended for Windows/macOS):** download the archive for your
+platform from the [Releases](https://github.com/samip5/dissimkl/releases) page,
+extract it, and run the binary. On Windows, launch `dissimkl.exe` from a terminal
+(PowerShell or Command Prompt) the first time so you can complete the interactive
+setup and PIN authorization.
+
+**Build from source:**
 
 ```sh
 git clone https://github.com/samip5/dissimkl
@@ -53,6 +61,10 @@ cd dissimkl
 cargo build --release
 ./target/release/dissimkl
 ```
+
+> On Linux, building requires the D-Bus development headers (used by the tray):
+> `sudo apt install libdbus-1-dev pkg-config` (Debian/Ubuntu) or
+> `sudo dnf install dbus-devel pkgconf-pkg-config` (Fedora).
 
 On first launch, the app will prompt you for:
 

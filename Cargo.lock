@@ -857,7 +857,6 @@ dependencies = [
  "tray-icon",
  "ureq",
  "winit",
- "winreg",
 ]
 
 [[package]]
