@@ -16,8 +16,8 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::discord::{app_id_key_for, DiscordState};
-use crate::simkl::SimklClient;
-use crate::state::{new_shared_state, SharedState};
+use crate::simkl::{NowWatching, SimklClient};
+use crate::state::{new_shared_state, PlaybackSession, SharedState};
 use crate::utils::{interactive_setup, load_config, Config};
 
 // ---------------------------------------------------------------------------
@@ -86,16 +86,56 @@ struct PollState {
     last_playback_fetch: Option<std::time::Instant>,
     /// Cached sessions from the last `/sync/playback` fetch.
     cached_sessions: Vec<crate::state::PlaybackSession>,
+    /// The last live "NOW WATCHING" session we saw, and when we saw it.
+    ///
+    /// The dashboard scrape is unreliable — it fails, gets served a cached or
+    /// logged-out page, or simply renders without the scrobble bar (the Simkl
+    /// site itself does not show "now watching" on every load either).  Since a
+    /// live session is invisible to `/sync/playback`, a single missed scrape
+    /// used to clear the presence outright; holding the last live session for a
+    /// grace period keeps Discord steady across the gaps.
+    last_live: Option<PlaybackSession>,
+    last_live_seen: Option<std::time::Instant>,
+    /// How long to keep showing `last_live` without a confirming scrape.
+    live_grace: Duration,
 }
 
 impl PollState {
-    fn new() -> Self {
+    fn new(poll_interval: Duration) -> Self {
         Self {
             last_tv_playback: None,
             last_anime_playback: None,
             last_movie_playback: None,
             last_playback_fetch: None,
             cached_sessions: Vec::new(),
+            last_live: None,
+            last_live_seen: None,
+            // Ride out at least a few consecutive failed scrapes, whatever the
+            // configured poll interval is.
+            live_grace: Duration::from_secs(LIVE_GRACE_SECS)
+                .max(poll_interval * LIVE_GRACE_MIN_CYCLES),
+        }
+    }
+
+    /// Record a freshly observed live session.
+    fn remember_live(&mut self, session: &PlaybackSession) {
+        self.last_live = Some(session.clone());
+        self.last_live_seen = Some(std::time::Instant::now());
+    }
+
+    /// Forget the cached live session — it ended, or its grace period lapsed.
+    fn forget_live(&mut self) {
+        self.last_live = None;
+        self.last_live_seen = None;
+    }
+
+    /// The cached live session, if it was last confirmed within the grace window.
+    fn live_within_grace(&self) -> Option<&PlaybackSession> {
+        let seen = self.last_live_seen?;
+        if seen.elapsed() <= self.live_grace {
+            self.last_live.as_ref()
+        } else {
+            None
         }
     }
 }
@@ -104,6 +144,16 @@ impl PollState {
 /// Catches completions (≥80% → session silently removed) and manual deletions,
 /// neither of which advances `activities.playback`.
 const FORCE_REFRESH_SECS: u64 = 120;
+
+/// How long a live "NOW WATCHING" session survives without the dashboard
+/// confirming it.  A pause or stop advances `activities.playback` and ends the
+/// grace period early, so this only bounds how long a *genuinely* finished
+/// session can linger when Simkl never reports the transition.
+const LIVE_GRACE_SECS: u64 = 150;
+
+/// Lower bound on the grace period expressed in poll cycles, so a long
+/// `poll_interval_secs` still tolerates a few consecutive failed scrapes.
+const LIVE_GRACE_MIN_CYCLES: u32 = 5;
 
 fn polling_loop(config: Config, state: SharedState, quit_flag: Arc<AtomicBool>) {
     let access_token = match &config.simkl_access_token {
@@ -117,9 +167,9 @@ fn polling_loop(config: Config, state: SharedState, quit_flag: Arc<AtomicBool>) 
     let mut simkl =
         SimklClient::new(config.simkl_client_id.clone(), access_token);
     let mut discord = DiscordState::new();
-    let mut poll_state = PollState::new();
     let window_hours = config.session_window_hours;
     let interval = Duration::from_secs(config.poll_interval_secs);
+    let mut poll_state = PollState::new(interval);
 
     loop {
         if quit_flag.load(Ordering::Relaxed) {
@@ -168,36 +218,16 @@ fn run_poll_cycle(
     //
     // If a live session is found, we show it in Discord immediately and skip the
     // activities + /sync/playback flow for this cycle.
-    if let Some(live_session) = simkl.get_now_watching() {
-        let kind = crate::discord::app_id_key_for(&live_session);
-        let app_id = config.discord_app_id(kind).map(|s| s.to_string());
-
-        // Prefer the poster URL from the cached API data; the dashboard img is
-        // available as a fallback via get_poster_url which checks the LRU cache.
-        let poster_url = live_session
-            .ids
-            .simkl
-            .and_then(|id| simkl.get_poster_url(id, &live_session.media_type));
-
-        {
-            let mut s = state.write().unwrap();
-            s.current_session = Some(live_session.clone());
-            s.discord_connected = discord.is_connected();
+    match simkl.get_now_watching() {
+        NowWatching::Live(live_session) => {
+            poll_state.remember_live(&live_session);
+            show_session(simkl, discord, state, config, &live_session);
+            return Ok(());
         }
-
-        if let Some(app_id) = app_id {
-            if let Err(e) = discord.set_watching(&live_session, poster_url.as_deref(), &app_id) {
-                warn!("Failed to update Discord presence (live): {:#}", e);
-            } else {
-                state.write().unwrap().discord_connected = true;
-            }
-        } else {
-            warn!(
-                "No Discord app_id configured for kind='{}' — skipping Rich Presence",
-                kind
-            );
+        NowWatching::Idle => debug!("Dashboard reports no active scrobble"),
+        NowWatching::Unknown => {
+            debug!("Dashboard probe inconclusive — falling back to the API")
         }
-        return Ok(());
     }
 
     // Step 1: fetch activities — a tiny JSON response, cheap every 15 s.
@@ -208,6 +238,30 @@ fn run_poll_cycle(
         activities.tv_playback()    != poll_state.last_tv_playback
         || activities.anime_playback() != poll_state.last_anime_playback
         || activities.movie_playback() != poll_state.last_movie_playback;
+
+    // Step 1b: hold a recent live session through a dashboard that failed to
+    // report it.
+    //
+    // Pausing or stopping advances `activities.playback`, so an *unchanged*
+    // timestamp means the session almost certainly is still running and the
+    // dashboard simply did not render the scrobble bar this cycle.  Without
+    // this, every such gap fell through to /sync/playback — which by design
+    // never contains an active scrobble — and cleared the presence, making it
+    // blink off and back on again on the next successful scrape.
+    //
+    // A real pause flips `playback_changed`, ending the grace period at once,
+    // so this costs no responsiveness when playback genuinely stops.
+    if !playback_changed {
+        if let Some(session) = poll_state.live_within_grace().cloned() {
+            debug!(
+                "Holding live presence for '{}' — dashboard did not confirm it this cycle",
+                session.display_label()
+            );
+            show_session(simkl, discord, state, config, &session);
+            return Ok(());
+        }
+    }
+    poll_state.forget_live();
 
     let force_refresh = poll_state
         .last_playback_fetch
@@ -264,40 +318,7 @@ fn run_poll_cycle(
 
     match active {
         Some(session) => {
-            info!(
-                "Showing: {} ({:?})",
-                session.display_label(),
-                session.media_type
-            );
-
-            let kind = app_id_key_for(&session);
-            let app_id = config.discord_app_id(kind).map(|s| s.to_string());
-
-            let poster_url = session
-                .ids
-                .simkl
-                .and_then(|id| simkl.get_poster_url(id, &session.media_type));
-
-            {
-                let mut s = state.write().unwrap();
-                s.current_session = Some(session.clone());
-                s.discord_connected = discord.is_connected();
-            }
-
-            if let Some(app_id) = app_id {
-                if let Err(e) =
-                    discord.set_watching(&session, poster_url.as_deref(), &app_id)
-                {
-                    warn!("Failed to update Discord presence: {:#}", e);
-                } else {
-                    state.write().unwrap().discord_connected = true;
-                }
-            } else {
-                warn!(
-                    "No Discord app_id configured for kind='{}' — skipping Rich Presence",
-                    kind
-                );
-            }
+            show_session(simkl, discord, state, config, &session);
         }
         None => {
             if poll_state.cached_sessions.is_empty() {
@@ -320,6 +341,53 @@ fn run_poll_cycle(
     }
 
     Ok(())
+}
+
+/// Push a session to Discord and mirror it into the shared tray state.
+///
+/// Shared by the live-scrape path and the `/sync/playback` path so both behave
+/// identically — notably, both go through `DiscordState`'s de-duplication, which
+/// leaves an unchanged presence completely untouched.
+fn show_session(
+    simkl: &mut SimklClient,
+    discord: &mut DiscordState,
+    state: &SharedState,
+    config: &Config,
+    session: &PlaybackSession,
+) {
+    debug!(
+        "Showing: {} ({:?})",
+        session.display_label(),
+        session.media_type
+    );
+
+    let kind = app_id_key_for(session);
+
+    // Prefer the poster URL from the cached API data; for live sessions the
+    // dashboard img has already been pre-cached, so this is a cache hit.
+    let poster_url = session
+        .ids
+        .simkl
+        .and_then(|id| simkl.get_poster_url(id, &session.media_type));
+
+    {
+        let mut s = state.write().unwrap();
+        s.current_session = Some(session.clone());
+        s.discord_connected = discord.is_connected();
+    }
+
+    let Some(app_id) = config.discord_app_id(kind).map(|s| s.to_string()) else {
+        warn!(
+            "No Discord app_id configured for kind='{}' — skipping Rich Presence",
+            kind
+        );
+        return;
+    };
+
+    match discord.set_watching(session, poster_url.as_deref(), &app_id) {
+        Ok(_) => state.write().unwrap().discord_connected = true,
+        Err(e) => warn!("Failed to update Discord presence: {:#}", e),
+    }
 }
 
 // ---------------------------------------------------------------------------

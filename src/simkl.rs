@@ -538,34 +538,55 @@ impl SimklClient {
     // bar data attributes.
     // -----------------------------------------------------------------------
 
-    /// Fetch the Simkl dashboard and extract an active "NOW WATCHING" session,
-    /// if any.  Returns `None` if:
-    ///   • the user ID cannot be determined
-    ///   • the dashboard is unreachable
-    ///   • the scrobble bar element is absent (nothing playing)
-    ///   • the HTML cannot be parsed
-    pub fn get_now_watching(&mut self) -> Option<PlaybackSession> {
-        let user_id = self.ensure_user_id()?;
+    /// Fetch the Simkl dashboard and extract an active "NOW WATCHING" session.
+    ///
+    /// The three outcomes are deliberately kept apart — see [`NowWatching`].
+    /// Collapsing "we could not tell" into "nothing is playing" makes the
+    /// Discord presence flap on and off whenever the dashboard hiccups.
+    pub fn get_now_watching(&mut self) -> NowWatching {
+        let Some(user_id) = self.ensure_user_id() else {
+            return NowWatching::Unknown;
+        };
         let url = format!("https://simkl.com/{}/dashboard/", user_id);
         debug!("Scraping dashboard for NOW WATCHING: {}", url);
 
-        let resp = self.agent
-            .get(&url)
-            // Try the OAuth Bearer token — Simkl's web server accepts it for
-            // authenticated page requests in addition to the standard API.
-            .set("Authorization", &format!("Bearer {}", self.access_token))
-            // Some web endpoints also accept the token as a cookie.
-            .set("Cookie", &format!("simkl_access_token={}", self.access_token))
-            .set("Accept", "text/html,application/xhtml+xml")
-            .call()
-            .map_err(|e| { warn!("Dashboard fetch failed: {}", e); e })
-            .ok()?;
+        // Retry like every other request we make — the dashboard is at least
+        // as flaky as the API, and a single dropped connection used to be
+        // enough to blank the Rich Presence for a poll cycle.
+        let fetched = execute_with_retry(&self.retry_config, |attempt| {
+            debug!(attempt, "GET dashboard");
+            let resp = wrap_ureq(|| {
+                self.agent
+                    .get(&url)
+                    // Try the OAuth Bearer token — Simkl's web server accepts
+                    // it for authenticated page requests in addition to the
+                    // standard API.
+                    .set("Authorization", &format!("Bearer {}", self.access_token))
+                    // Some web endpoints also accept the token as a cookie.
+                    .set("Cookie", &format!("simkl_access_token={}", self.access_token))
+                    .set("Accept", "text/html,application/xhtml+xml")
+                    .call()
+            })?;
+            resp.into_string().map_err(|e| {
+                (
+                    ErrorKind::Retryable,
+                    anyhow!("Failed to read dashboard body: {}", e),
+                )
+            })
+        });
 
-        let html = resp.into_string()
-            .map_err(|e| { warn!("Dashboard read failed: {}", e); e })
-            .ok()?;
+        let html = match fetched {
+            Ok(html) => html,
+            Err(e) => {
+                warn!("Dashboard fetch failed: {:#}", e);
+                return NowWatching::Unknown;
+            }
+        };
 
-        let session = parse_now_watching(&html)?;
+        let session = match parse_now_watching(&html) {
+            NowWatching::Live(session) => session,
+            other => return other,
+        };
 
         // Pre-populate the poster cache from the dashboard img so that the
         // subsequent get_poster_url() call in main.rs is a cache hit and
@@ -579,7 +600,7 @@ impl SimklClient {
             }
         }
 
-        Some(session)
+        NowWatching::Live(session)
     }
 }
 
@@ -588,20 +609,53 @@ impl SimklClient {
 // TODO: This is not a great way to do this, but other ways don't exist.
 // ---------------------------------------------------------------------------
 
-/// Parse the Simkl dashboard HTML and return the active session, if present.
-fn parse_now_watching(html: &str) -> Option<PlaybackSession> {
+/// Outcome of a NOW WATCHING dashboard probe.
+///
+/// `Idle` and `Unknown` are kept distinct on purpose: `Idle` is positive
+/// evidence that nothing is playing, whereas `Unknown` means the probe told us
+/// nothing at all.  Treating `Unknown` as `Idle` clears the Discord presence on
+/// every transient dashboard failure, which is what made it blink in and out.
+#[derive(Debug)]
+pub enum NowWatching {
+    /// An active scrobble was found and parsed.
+    /// Boxed to keep the enum small — the idle/unknown variants are the
+    /// common case and carry no payload.
+    Live(Box<PlaybackSession>),
+    /// The dashboard rendered and there is no active scrobble.
+    Idle,
+    /// Inconclusive — the fetch failed, the page was not the logged-in
+    /// dashboard, or the scrobble bar was present but unparseable.
+    Unknown,
+}
+
+/// Parse the Simkl dashboard HTML and classify the current scrobble state.
+fn parse_now_watching(html: &str) -> NowWatching {
     use scraper::{Html, Selector};
 
     let doc = Html::parse_document(html);
 
-    // Find the scrobble bar element.
-    let bar_sel = Selector::parse("#simklScrobbleBar").ok()?;
-    let bar = doc.select(&bar_sel).next()?;
+    // Find the scrobble bar element.  A missing bar is the normal "nothing is
+    // playing" rendering; a selector that fails to compile is our own bug.
+    let Ok(bar_sel) = Selector::parse("#simklScrobbleBar") else {
+        return NowWatching::Unknown;
+    };
+    let Some(bar) = doc.select(&bar_sel).next() else {
+        debug!("NOW WATCHING: no scrobble bar on the dashboard — nothing playing");
+        return NowWatching::Idle;
+    };
 
     let attr = |name: &str| bar.value().attr(name);
 
-    let started_at: i64 = attr("data-started")?.parse().ok()?;
-    let runtime_mins: u64 = attr("data-runtime")?.parse().ok()?;
+    // The bar exists but carries no scrobble data — Simkl renders it empty
+    // between sessions, so this is also a genuine idle state.
+    let (Some(started_at), Some(runtime_mins)) = (
+        attr("data-started").and_then(|v| v.parse::<i64>().ok()),
+        attr("data-runtime").and_then(|v| v.parse::<u64>().ok()),
+    ) else {
+        debug!("NOW WATCHING: scrobble bar has no start/runtime data — nothing playing");
+        return NowWatching::Idle;
+    };
+
     let progress_at_start: f64 = attr("data-progress-at-start")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0);
@@ -620,7 +674,9 @@ fn parse_now_watching(html: &str) -> Option<PlaybackSession> {
     //   /tv/1029/star-trek-the-next-generation/season-1/episode-16/
     //   /movies/12345/inception/
     //   /anime/6789/attack-on-titan/season-1/episode-5/
-    let link_sel = Selector::parse("a[href]").ok()?;
+    let Ok(link_sel) = Selector::parse("a[href]") else {
+        return NowWatching::Unknown;
+    };
     let mut media_kind = String::new();
     let mut simkl_id: Option<u64> = None;
     let mut slug: Option<String> = None;
@@ -645,9 +701,11 @@ fn parse_now_watching(html: &str) -> Option<PlaybackSession> {
         }
     }
 
+    // A bar carrying scrobble data but no media link means the page rendered
+    // partially or we were served a logged-out view — not evidence of idleness.
     if media_kind.is_empty() {
-        debug!("NOW WATCHING: scrobble bar found but no media link — possibly logged out");
-        return None;
+        warn!("NOW WATCHING: scrobble bar found but no media link — possibly logged out");
+        return NowWatching::Unknown;
     }
 
     // Try to get a better title from dedicated title elements before falling
@@ -687,12 +745,14 @@ fn parse_now_watching(html: &str) -> Option<PlaybackSession> {
     // (We can't call self.poster_cache here since we're outside the impl —
     //  the caller may add it separately.)
 
-    info!(
+    // Debug, not info: this runs on every poll cycle for the whole duration of
+    // an episode.
+    debug!(
         "NOW WATCHING: {} ({:?}) — started {}s ago, {}min runtime, progress {:.1}%",
         title, media_type, elapsed_secs, runtime_mins, progress
     );
 
-    Some(PlaybackSession {
+    NowWatching::Live(Box::new(PlaybackSession {
         id: 0, // no API id for live sessions
         progress,
         paused_at: Utc::now(), // "just now" — keeps it within any session window
@@ -706,7 +766,7 @@ fn parse_now_watching(html: &str) -> Option<PlaybackSession> {
         anime_type: None,
         live_start: Some(started_at),
         runtime_mins: Some(runtime_mins),
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------

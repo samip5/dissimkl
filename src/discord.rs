@@ -13,6 +13,11 @@ pub struct DiscordState {
     current_app_id: Option<String>,
     /// The IPC client (present when connected).
     client: Option<DiscordIpcClient>,
+    /// Fingerprint of the activity Discord last accepted, or `None` when the
+    /// presence is cleared.  Discord keeps a presence until it is changed, so
+    /// re-sending an identical payload every poll buys nothing and only feeds
+    /// its rate limiter.
+    last_activity: Option<String>,
 }
 
 impl DiscordState {
@@ -20,6 +25,7 @@ impl DiscordState {
         Self {
             current_app_id: None,
             client: None,
+            last_activity: None,
         }
     }
 
@@ -64,6 +70,9 @@ impl DiscordState {
             let _ = client.close();
         }
         self.current_app_id = None;
+        // Discord drops the presence with the connection, so the next
+        // set_watching must re-send even if the content is unchanged.
+        self.last_activity = None;
     }
 
     /// Disconnect from Discord, suppressing errors.
@@ -83,15 +92,15 @@ impl DiscordState {
     /// * `session`    — current playback session
     /// * `poster_url` — resolved poster URL (or `None` to use the app's default art)
     /// * `app_id`     — Discord application ID to use
+    ///
+    /// Returns `true` if a new payload was actually sent to Discord, `false` if
+    /// the presence already matched and the update was skipped.
     pub fn set_watching(
         &mut self,
         session: &PlaybackSession,
         poster_url: Option<&str>,
         app_id: &str,
-    ) -> Result<()> {
-        self.ensure_connected(app_id)
-            .context("Connecting to Discord before set_watching")?;
-
+    ) -> Result<bool> {
         // Build strings we need as owned values first so they outlive the activity builder.
         let details = build_details(session);
         let state_str = build_state(session);
@@ -103,19 +112,25 @@ impl DiscordState {
         //   an end time so Discord shows a countdown bar.
         // • Paused session: fake the start by subtracting elapsed watch-time from
         //   the paused_at timestamp.
-        let timestamps = if let Some(live_start) = session.live_start {
-            let mut ts = Timestamps::new().start(live_start);
-            if let Some(runtime) = session.runtime_mins {
-                let end = live_start + runtime as i64 * 60;
-                ts = ts.end(end);
-            }
-            ts
+        //
+        // Both are derived purely from the session, so an unchanged session
+        // yields identical timestamps — which is what lets the fingerprint
+        // below suppress redundant updates.
+        let (start_ts, end_ts) = if let Some(live_start) = session.live_start {
+            let end = session
+                .runtime_mins
+                .map(|runtime| live_start + runtime as i64 * 60);
+            (live_start, end)
         } else {
             let runtime_secs = session.estimated_runtime_secs();
             let watched_secs = (session.progress / 100.0 * runtime_secs as f64) as i64;
-            let start_ts = session.paused_at.timestamp() - watched_secs;
-            Timestamps::new().start(start_ts)
+            (session.paused_at.timestamp() - watched_secs, None)
         };
+
+        let mut timestamps = Timestamps::new().start(start_ts);
+        if let Some(end) = end_ts {
+            timestamps = timestamps.end(end);
+        }
 
         // Build up to 2 buttons (owned Strings coerce into Cow<str>).
         let mut button_data: Vec<(String, String)> = Vec::new();
@@ -138,6 +153,27 @@ impl DiscordState {
         }
         // Limit to 2 buttons (Discord cap).
         button_data.truncate(2);
+
+        // Everything Discord will render is now known — fingerprint it and skip
+        // the round-trip if we already have exactly this presence up.
+        let fingerprint = format!(
+            "{app_id}|{details}|{state_str}|{large_image}|{large_text}|{start_ts}|{end_ts:?}|{}",
+            button_data
+                .iter()
+                .map(|(label, url)| format!("{label}={url}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        if self.client.is_some()
+            && self.current_app_id.as_deref() == Some(app_id)
+            && self.last_activity.as_deref() == Some(fingerprint.as_str())
+        {
+            debug!("Discord presence unchanged — skipping update");
+            return Ok(false);
+        }
+
+        self.ensure_connected(app_id)
+            .context("Connecting to Discord before set_watching")?;
 
         // Build buttons from the owned data.
         let buttons: Vec<Button<'_>> = button_data
@@ -165,11 +201,9 @@ impl DiscordState {
         let client = self.client.as_mut().unwrap();
         match client.set_activity(activity) {
             Ok(_) => {
-                debug!(
-                    "Discord Rich Presence updated: {} — {}",
-                    details, state_str
-                );
-                Ok(())
+                info!("Discord Rich Presence: {} — {}", details, state_str);
+                self.last_activity = Some(fingerprint);
+                Ok(true)
             }
             Err(e) => {
                 warn!(
@@ -184,12 +218,20 @@ impl DiscordState {
     }
 
     /// Clear the Rich Presence (nothing is playing).
-    pub fn clear(&mut self) -> Result<()> {
+    ///
+    /// Returns `true` if a clear was actually sent, `false` if the presence was
+    /// already empty.
+    pub fn clear(&mut self) -> Result<bool> {
+        // Already cleared (or never set) — don't touch the connection.
+        if self.last_activity.is_none() {
+            return Ok(false);
+        }
         if let Some(client) = self.client.as_mut() {
             match client.clear_activity() {
                 Ok(_) => {
-                    debug!("Discord Rich Presence cleared");
-                    Ok(())
+                    info!("Discord Rich Presence cleared");
+                    self.last_activity = None;
+                    Ok(true)
                 }
                 Err(e) => {
                     warn!("Failed to clear Discord activity: {}", e);
@@ -199,7 +241,8 @@ impl DiscordState {
             }
         } else {
             // Not connected — nothing to clear.
-            Ok(())
+            self.last_activity = None;
+            Ok(false)
         }
     }
 }
