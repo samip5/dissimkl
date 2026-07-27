@@ -290,10 +290,14 @@ pub struct SimklClient {
 
 impl SimklClient {
     pub fn new(client_id: String, access_token: String) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(20))
-            .build();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(10)))
+            // ureq 2's single `timeout_read` covered both header and body
+            // reads; ureq 3 splits it into these two.
+            .timeout_recv_response(Some(Duration::from_secs(20)))
+            .timeout_recv_body(Some(Duration::from_secs(20)))
+            .build()
+            .into();
 
         Self {
             client_id,
@@ -312,15 +316,15 @@ impl SimklClient {
     // Auth headers helper
     // -----------------------------------------------------------------------
 
-    fn get_request(&self, path: &str) -> ureq::Request {
+    fn get_request(&self, path: &str) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
         self.agent
             .get(&format!("{}{}", self.base_url, path))
-            .set(
+            .header(
                 "Authorization",
                 &format!("Bearer {}", self.access_token),
             )
-            .set("simkl-api-key", &self.client_id)
-            .set("Content-Type", "application/json")
+            .header("simkl-api-key", &self.client_id)
+            .header("Content-Type", "application/json")
     }
 
     // -----------------------------------------------------------------------
@@ -336,7 +340,7 @@ impl SimklClient {
         execute_with_retry(&self.retry_config, |attempt| {
             debug!(attempt, "fetching /sync/activities");
             let resp = wrap_ureq(|| self.get_request("/sync/activities").call())?;
-            resp.into_json::<ActivitiesResponse>().map_err(|e| {
+            resp.into_body().read_json::<ActivitiesResponse>().map_err(|e| {
                 (ErrorKind::Fatal, anyhow!("Failed to parse activities: {}", e))
             })
         })
@@ -361,7 +365,7 @@ impl SimklClient {
                 // the open question: does GET /sync/playback return active
                 // `start` sessions or only `pause`/`stop` ones?
                 let value: serde_json::Value =
-                    resp.into_json().map_err(|e| {
+                    resp.into_body().read_json().map_err(|e| {
                         (
                             ErrorKind::Fatal,
                             anyhow!("Failed to read playback body: {}", e),
@@ -426,10 +430,10 @@ impl SimklClient {
                 self.agent
                     .get(&format!("{}/{}/{}", self.base_url, segment, simkl_id))
                     .query("extended", "full")
-                    .set("simkl-api-key", &self.client_id)
+                    .header("simkl-api-key", &self.client_id)
                     .call()
             })?;
-            resp.into_json::<ExtendedInfoResponse>().map_err(|e| {
+            resp.into_body().read_json::<ExtendedInfoResponse>().map_err(|e| {
                 (
                     ErrorKind::Fatal,
                     anyhow!("Failed to parse extended info: {}", e),
@@ -486,7 +490,7 @@ impl SimklClient {
         let value: serde_json::Value = execute_with_retry(&self.retry_config, |attempt| {
             debug!(attempt, "fetching /users/settings");
             let r = wrap_ureq(|| self.get_request("/users/settings").call())?;
-            r.into_json().map_err(|e| {
+            r.into_body().read_json().map_err(|e| {
                 (ErrorKind::Fatal, anyhow!("Failed to parse user settings: {}", e))
             })
         }).context("fetch_user_id failed")?;
@@ -561,13 +565,13 @@ impl SimklClient {
                     // Try the OAuth Bearer token — Simkl's web server accepts
                     // it for authenticated page requests in addition to the
                     // standard API.
-                    .set("Authorization", &format!("Bearer {}", self.access_token))
+                    .header("Authorization", &format!("Bearer {}", self.access_token))
                     // Some web endpoints also accept the token as a cookie.
-                    .set("Cookie", &format!("simkl_access_token={}", self.access_token))
-                    .set("Accept", "text/html,application/xhtml+xml")
+                    .header("Cookie", &format!("simkl_access_token={}", self.access_token))
+                    .header("Accept", "text/html,application/xhtml+xml")
                     .call()
             })?;
-            resp.into_string().map_err(|e| {
+            resp.into_body().read_to_string().map_err(|e| {
                 (
                     ErrorKind::Retryable,
                     anyhow!("Failed to read dashboard body: {}", e),

@@ -174,7 +174,8 @@ pub fn run_pin_auth(client_id: &str) -> Result<String> {
         .get(&pin_url)
         .call()
         .context("Failed to request PIN from Simkl")?
-        .into_json()
+        .into_body()
+        .read_json()
         .context("Failed to parse PIN response")?;
 
     println!();
@@ -219,7 +220,7 @@ pub fn run_pin_auth(client_id: &str) -> Result<String> {
             }
         };
 
-        let parsed: PinPollResponse = match poll_resp.into_json() {
+        let parsed: PinPollResponse = match poll_resp.into_body().read_json() {
             Ok(p) => p,
             Err(e) => {
                 warn!("Failed to parse poll response: {}", e);

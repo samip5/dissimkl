@@ -55,11 +55,21 @@ pub enum ErrorKind {
 /// Classify a `ureq::Error` to decide if we should retry.
 pub fn classify_ureq_error(err: &ureq::Error) -> ErrorKind {
     match err {
-        ureq::Error::Status(status, _) => match *status {
-            429 | 500..=599 => ErrorKind::Retryable,
-            _ => ErrorKind::Fatal,
-        },
-        ureq::Error::Transport(_) => ErrorKind::Retryable,
+        ureq::Error::StatusCode(429 | 500..=599) => ErrorKind::Retryable,
+        ureq::Error::StatusCode(_) => ErrorKind::Fatal,
+        // Transport-level failures — the ureq 2 `Transport` variant split into
+        // these in ureq 3. All are worth another attempt.
+        ureq::Error::Io(_)
+        | ureq::Error::Timeout(_)
+        | ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::ConnectProxyFailed(_)
+        | ureq::Error::Protocol(_)
+        | ureq::Error::Tls(_) => ErrorKind::Retryable,
+        // Bad URIs, malformed headers, JSON parse failures, redirect limits —
+        // retrying these just burns the backoff budget. `ureq::Error` is
+        // `#[non_exhaustive]`, so this arm is also the catch-all.
+        _ => ErrorKind::Fatal,
     }
 }
 

@@ -437,6 +437,8 @@ fn generate_icon_rgba() -> Vec<u8> {
 #[cfg(target_os = "linux")]
 mod tray_impl {
     use super::*;
+    use anyhow::Context;
+    use ksni::blocking::TrayMethods;
     use std::sync::Mutex;
 
     struct DissimklTray {
@@ -447,6 +449,12 @@ mod tray_impl {
     }
 
     impl ksni::Tray for DissimklTray {
+        /// Must be stable across sessions — ksni 0.3 made this a required
+        /// method rather than defaulting it.
+        fn id(&self) -> String {
+            env!("CARGO_PKG_NAME").to_string()
+        }
+
         fn icon_name(&self) -> String {
             "media-playback-start".to_string()
         }
@@ -515,8 +523,7 @@ mod tray_impl {
             quit_flag: Arc::clone(&quit_flag),
             is_paused,
         };
-        let service = ksni::TrayService::new(tray);
-        let _handle = service.spawn();
+        let _handle = tray.spawn().context("Failed to start system tray")?;
         // Block until quit is requested.
         loop {
             thread::sleep(Duration::from_millis(200));
