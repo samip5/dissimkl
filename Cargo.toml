@@ -31,7 +31,7 @@ scraper = "0.22"
 ksni = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-tray-icon = "0.19"
+tray-icon = "0.24"
 
 [profile.release]
 opt-level = 3
