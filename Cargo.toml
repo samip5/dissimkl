@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 discord-rich-presence = "1.1"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
