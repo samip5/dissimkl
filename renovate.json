@@ -6,19 +6,16 @@
   ],
   "packageRules": [
     {
+      "description": "Keep in-range Cargo updates confined to Cargo.lock",
+      "matchManagers": ["cargo"],
+      "rangeStrategy": "update-lockfile"
+    },
+    {
       "description": "Group patch updates that only touch Cargo.lock into a single PR",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["patch"],
-      "rangeStrategy": "update-lockfile",
       "groupName": "lockfile patch updates",
       "commitMessageTopic": "{{{groupName}}}"
-    },
-    {
-      "description": "Auto-merge GitHub Actions minor and patch updates",
-      "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["minor", "patch", "digest"],
-      "automerge": true,
-      "automergeType": "branch"
     }
   ]
 }
