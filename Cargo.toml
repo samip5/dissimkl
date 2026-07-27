@@ -23,7 +23,7 @@ lru = "0.12"
 open = "5"
 winit = "0.30"
 anyhow = "1"
-dirs = "5"
+dirs = "6"
 dark-light = "2"
 scraper = "0.22"
 
