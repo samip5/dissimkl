@@ -104,6 +104,9 @@ impl DiscordState {
         // Build strings we need as owned values first so they outlive the activity builder.
         let details = build_details(session);
         let state_str = build_state(session);
+        // Discord keeps whatever presence it already has, so omitting `state`
+        // is only safe because a changed value always changes the fingerprint
+        // below, forcing a full re-send rather than a partial update.
         let large_image: String = poster_url.unwrap_or("simkl").to_string();
         let large_text: String = session.title.clone();
 
@@ -157,7 +160,7 @@ impl DiscordState {
         // Everything Discord will render is now known — fingerprint it and skip
         // the round-trip if we already have exactly this presence up.
         let fingerprint = format!(
-            "{app_id}|{details}|{state_str}|{large_image}|{large_text}|{start_ts}|{end_ts:?}|{}",
+            "{app_id}|{details}|{state_str:?}|{large_image}|{large_text}|{start_ts}|{end_ts:?}|{}",
             button_data
                 .iter()
                 .map(|(label, url)| format!("{label}={url}"))
@@ -190,9 +193,12 @@ impl DiscordState {
         let mut activity = Activity::new()
             .activity_type(ActivityType::Watching)
             .details(details.as_str())
-            .state(state_str.as_str())
             .assets(assets)
             .timestamps(timestamps);
+
+        if let Some(state) = state_str.as_deref() {
+            activity = activity.state(state);
+        }
 
         if !buttons.is_empty() {
             activity = activity.buttons(buttons);
@@ -201,7 +207,10 @@ impl DiscordState {
         let client = self.client.as_mut().unwrap();
         match client.set_activity(activity) {
             Ok(_) => {
-                info!("Discord Rich Presence: {} — {}", details, state_str);
+                match state_str.as_deref() {
+                    Some(state) => info!("Discord Rich Presence: {} — {}", details, state),
+                    None => info!("Discord Rich Presence: {}", details),
+                }
                 self.last_activity = Some(fingerprint);
                 Ok(true)
             }
@@ -268,20 +277,27 @@ fn build_details(session: &PlaybackSession) -> String {
     }
 }
 
-/// Returns the `state` line: episode code + title (or progress for movies).
+/// Returns the `state` line: episode code + title (or progress for movies), or
+/// `None` when there is nothing worth putting there.
 ///
 /// Discord shows this as the smaller second line.
 /// e.g. "S01E16 • Too Short a Season"
-fn build_state(session: &PlaybackSession) -> String {
+///
+/// A live movie yields `None`: the activity type already renders as "Watching"
+/// and the timestamps draw a countdown bar, so a second line saying as much
+/// again is pure noise.
+fn build_state(session: &PlaybackSession) -> Option<String> {
     match &session.media_type {
-        MediaType::Episode | MediaType::Anime => {
-            build_episode_state(session.season, session.episode, session.episode_title.as_deref())
-        }
+        MediaType::Episode | MediaType::Anime => Some(build_episode_state(
+            session.season,
+            session.episode,
+            session.episode_title.as_deref(),
+        )),
         MediaType::Movie | MediaType::AnimeMovie => {
             if session.is_live() {
-                "Watching now".to_string()
+                None
             } else {
-                format!("{:.0}% watched", session.progress)
+                Some(format!("{:.0}% watched", session.progress))
             }
         }
     }

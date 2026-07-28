@@ -260,28 +260,45 @@ impl RawPlaybackEntry {
 }
 
 // ---------------------------------------------------------------------------
-// Extended info response (for poster hash)
+// Extended info response (for poster hash + year)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 struct ExtendedInfoResponse {
     #[serde(default)]
     poster: Option<String>,
+    #[serde(default)]
+    year: Option<u32>,
+}
+
+/// What we keep from `/{type}/{id}?extended=full`, cached per Simkl id.
+///
+/// Both fields are wanted by different callers (poster for the Discord art,
+/// year for the title label), so they share one cache entry and therefore one
+/// API round-trip.
+#[derive(Debug, Clone, Default)]
+struct CachedInfo {
+    poster_url: Option<String>,
+    year: Option<u32>,
+    /// True once the API has actually answered for this id.  The live-scrape
+    /// path seeds entries from dashboard HTML, which carries a poster but no
+    /// year — so a present entry is not by itself proof that `year` is known.
+    from_api: bool,
 }
 
 // ---------------------------------------------------------------------------
 // Simkl API client
 // ---------------------------------------------------------------------------
 
-/// Number of poster URLs to cache in memory.
-const POSTER_CACHE_SIZE: usize = 128;
+/// Number of extended-info entries to cache in memory.
+const INFO_CACHE_SIZE: usize = 128;
 
 pub struct SimklClient {
     pub client_id: String,
     pub access_token: String,
     pub base_url: String,
     agent: ureq::Agent,
-    poster_cache: LruCache<u64, String>,
+    info_cache: LruCache<u64, CachedInfo>,
     retry_config: RetryConfig,
     /// Numeric Simkl user ID — fetched lazily from /users/settings.
     /// Used to construct the dashboard URL for NOW WATCHING scraping.
@@ -304,8 +321,8 @@ impl SimklClient {
             access_token,
             base_url: "https://api.simkl.com".to_string(),
             agent,
-            poster_cache: LruCache::new(
-                std::num::NonZeroUsize::new(POSTER_CACHE_SIZE).unwrap(),
+            info_cache: LruCache::new(
+                std::num::NonZeroUsize::new(INFO_CACHE_SIZE).unwrap(),
             ),
             retry_config: RetryConfig::default(),
             user_id: None,
@@ -404,17 +421,50 @@ impl SimklClient {
     }
 
     // -----------------------------------------------------------------------
-    // GET /{type}/{simkl_id}?extended=full — for poster hash
+    // GET /{type}/{simkl_id}?extended=full — for poster hash + year
     // -----------------------------------------------------------------------
 
+    /// Poster URL for a title, or `None` if it has none.
     pub fn get_poster_url(
         &mut self,
         simkl_id: u64,
         media_type: &MediaType,
     ) -> Option<String> {
-        // Return from cache if available.
-        if let Some(url) = self.poster_cache.get(&simkl_id) {
-            return Some(url.clone());
+        // A dashboard-seeded entry already carries the poster even though its
+        // year is still unknown, so answer from it without hitting the API.
+        if let Some(url) = self
+            .info_cache
+            .get(&simkl_id)
+            .and_then(|info| info.poster_url.clone())
+        {
+            return Some(url);
+        }
+        self.get_extended_info(simkl_id, media_type).poster_url
+    }
+
+    /// Release year for a title, or `None` if the API doesn't know one.
+    pub fn get_year(&mut self, simkl_id: u64, media_type: &MediaType) -> Option<u32> {
+        self.get_extended_info(simkl_id, media_type).year
+    }
+
+    /// Seed the cache with a poster URL obtained outside the API (the live
+    /// dashboard scrape), leaving any already-fetched fields intact.
+    fn cache_scraped_poster(&mut self, simkl_id: u64, url: String) {
+        let entry = self.info_cache.get_or_insert_mut(simkl_id, CachedInfo::default);
+        if entry.poster_url.is_none() {
+            entry.poster_url = Some(url);
+        }
+    }
+
+    /// Fetch (or return cached) extended info for a title.
+    ///
+    /// A failed request is not cached, so the next poll retries; a successful
+    /// one is, negative fields included, so we ask at most once per title.
+    fn get_extended_info(&mut self, simkl_id: u64, media_type: &MediaType) -> CachedInfo {
+        if let Some(info) = self.info_cache.get(&simkl_id) {
+            if info.from_api {
+                return info.clone();
+            }
         }
 
         let segment = match media_type {
@@ -422,10 +472,9 @@ impl SimklClient {
             MediaType::Movie => "movies",
             MediaType::Anime | MediaType::AnimeMovie => "anime",
         };
-        let path = format!("/{}?id={}&extended=full", segment, simkl_id);
 
         let result = execute_with_retry(&self.retry_config, |attempt| {
-            debug!(attempt, "GET /{} for poster (id={})", segment, simkl_id);
+            debug!(attempt, "GET /{} for extended info (id={})", segment, simkl_id);
             let resp = wrap_ureq(|| {
                 self.agent
                     .get(&format!("{}/{}/{}", self.base_url, segment, simkl_id))
@@ -441,27 +490,28 @@ impl SimklClient {
             })
         });
 
-        match result {
-            Ok(info) => {
-                if let Some(hash) = info.poster {
-                    if hash.len() >= 2 {
-                        let prefix = &hash[..2];
-                        let url = format!(
-                            "https://wsrv.nl/?url=https://simkl.in/posters/{}/{}_m.webp",
-                            prefix, hash
-                        );
-                        self.poster_cache.put(simkl_id, url.clone());
-                        return Some(url);
-                    }
-                }
-                None
-            }
+        let response = match result {
+            Ok(response) => response,
             Err(e) => {
-                warn!("Could not fetch poster for simkl_id={}: {}", simkl_id, e);
-                let _ = path; // silence unused warning
-                None
+                warn!(
+                    "Could not fetch extended info for simkl_id={}: {}",
+                    simkl_id, e
+                );
+                // Fall back to whatever the dashboard scrape gave us, if any.
+                return self.info_cache.get(&simkl_id).cloned().unwrap_or_default();
             }
+        };
+
+        let poster_url = response.poster.as_deref().and_then(poster_hash_to_wsrv);
+        let entry = self.info_cache.get_or_insert_mut(simkl_id, CachedInfo::default);
+        // The dashboard poster is as good as the API one — keep it if the API
+        // came back without a hash.
+        if poster_url.is_some() {
+            entry.poster_url = poster_url;
         }
+        entry.year = response.year;
+        entry.from_api = true;
+        entry.clone()
     }
 
     // -----------------------------------------------------------------------
@@ -587,21 +637,23 @@ impl SimklClient {
             }
         };
 
-        let session = match parse_now_watching(&html) {
+        let mut session = match parse_now_watching(&html) {
             NowWatching::Live(session) => session,
             other => return other,
         };
 
-        // Pre-populate the poster cache from the dashboard img so that the
-        // subsequent get_poster_url() call in main.rs is a cache hit and
-        // requires no extra API round-trip.
         if let Some(simkl_id) = session.ids.simkl {
-            if self.poster_cache.get(&simkl_id).is_none() {
-                if let Some(url) = extract_live_poster_url(&html) {
-                    debug!("Pre-caching live poster for simkl_id={}", simkl_id);
-                    self.poster_cache.put(simkl_id, url);
-                }
+            // Pre-populate the poster from the dashboard img so that the
+            // subsequent get_poster_url() call in main.rs is a cache hit and
+            // requires no extra API round-trip.
+            if let Some(url) = extract_live_poster_url(&html) {
+                debug!("Pre-caching live poster for simkl_id={}", simkl_id);
+                self.cache_scraped_poster(simkl_id, url);
             }
+            // The scrobble bar carries no year, so ask the API for one — it is
+            // what disambiguates remakes sharing a title.  Cached per id, so
+            // this costs one request per title watched, not one per poll.
+            session.year = self.get_year(simkl_id, &session.media_type);
         }
 
         NowWatching::Live(session)
@@ -681,21 +733,13 @@ fn parse_now_watching(html: &str) -> NowWatching {
     let Ok(link_sel) = Selector::parse("a[href]") else {
         return NowWatching::Unknown;
     };
-    let mut media_kind = String::new();
-    let mut simkl_id: Option<u64> = None;
-    let mut slug: Option<String> = None;
-    let mut season: Option<u32> = None;
-    let mut episode: Option<u32> = None;
+    let mut media: Option<MediaHref> = None;
     let mut link_title = String::new();
 
     for a in bar.select(&link_sel) {
         let href = a.value().attr("href").unwrap_or("");
-        if let Some((kind, id, sl, s, e)) = parse_media_href(href) {
-            media_kind = kind;
-            simkl_id = Some(id);
-            slug = Some(sl);
-            season = s;
-            episode = e;
+        if let Some(parsed) = parse_media_href(href) {
+            media = Some(parsed);
             let text: String = a.text().collect::<Vec<_>>().join(" ");
             let text = text.trim().to_string();
             if !text.is_empty() {
@@ -707,10 +751,10 @@ fn parse_now_watching(html: &str) -> NowWatching {
 
     // A bar carrying scrobble data but no media link means the page rendered
     // partially or we were served a logged-out view — not evidence of idleness.
-    if media_kind.is_empty() {
+    let Some(media) = media else {
         warn!("NOW WATCHING: scrobble bar found but no media link — possibly logged out");
         return NowWatching::Unknown;
-    }
+    };
 
     // Try to get a better title from dedicated title elements before falling
     // back to the link text.
@@ -733,21 +777,12 @@ fn parse_now_watching(html: &str) -> NowWatching {
     // (Poster URL is extracted separately via extract_live_poster_url so that
     //  get_now_watching can pre-populate the poster cache from &mut self.)
 
-    let media_type = match media_kind.as_str() {
-        "tv" => MediaType::Episode,
-        "movies" => MediaType::Movie,
-        _ => MediaType::Anime,  // "anime"
-    };
-
+    let media_type = media.media_type;
     let ids = MediaIds {
-        simkl: simkl_id,
-        slug,
+        simkl: Some(media.simkl_id),
+        slug: Some(media.slug),
         ..Default::default()
     };
-
-    // Cache the poster URL if we have both a simkl_id and a URL.
-    // (We can't call self.poster_cache here since we're outside the impl —
-    //  the caller may add it separately.)
 
     // Debug, not info: this runs on every poll cycle for the whole duration of
     // an episode.
@@ -762,10 +797,12 @@ fn parse_now_watching(html: &str) -> NowWatching {
         paused_at: Utc::now(), // "just now" — keeps it within any session window
         media_type,
         title,
+        // Filled in by get_now_watching from the extended-info API; the
+        // scrobble bar itself doesn't carry a year.
         year: None,
         ids,
-        season,
-        episode,
+        season: media.season,
+        episode: media.episode,
         episode_title: episode_title.as_deref().map(clean_episode_title),
         anime_type: None,
         live_start: Some(started_at),
@@ -830,20 +867,33 @@ fn find_text(
     None
 }
 
-/// Parse an href like `/tv/1029/star-trek-the-next-generation/season-1/episode-16/`
-/// into `(kind, simkl_id, slug, season, episode)`.
+/// The media identity carried by a Simkl page link.
+#[derive(Debug)]
+struct MediaHref {
+    media_type: MediaType,
+    simkl_id: u64,
+    slug: String,
+    season: Option<u32>,
+    episode: Option<u32>,
+}
+
+/// Parse an href like `/tv/1029/star-trek-the-next-generation/season-1/episode-16/`.
 /// Returns `None` if the href does not match a known media URL pattern.
-fn parse_media_href(href: &str) -> Option<(String, u64, String, Option<u32>, Option<u32>)> {
+fn parse_media_href(href: &str) -> Option<MediaHref> {
     let trimmed = href.trim_matches('/');
     let parts: Vec<&str> = trimmed.split('/').collect();
     if parts.len() < 3 {
         return None;
     }
-    let kind = parts[0];
-    if !matches!(kind, "tv" | "movies" | "anime") {
-        return None;
-    }
-    let id: u64 = parts[1].parse().ok()?;
+    // The URL kind is also the validity check: an href we can't map to a media
+    // type isn't a media link.
+    let media_type = match parts[0] {
+        "tv" => MediaType::Episode,
+        "movies" => MediaType::Movie,
+        "anime" => MediaType::Anime,
+        _ => return None,
+    };
+    let simkl_id: u64 = parts[1].parse().ok()?;
     let slug = parts[2].to_string();
     if slug.is_empty() {
         return None;
@@ -859,7 +909,13 @@ fn parse_media_href(href: &str) -> Option<(String, u64, String, Option<u32>, Opt
         }
     }
 
-    Some((kind.to_string(), id, slug, season, episode))
+    Some(MediaHref {
+        media_type,
+        simkl_id,
+        slug,
+        season,
+        episode,
+    })
 }
 
 /// Convert a `//simkl.in/posters/…` or `https://simkl.in/posters/…` URL into
@@ -877,6 +933,12 @@ fn simkl_poster_to_wsrv(src: &str) -> Option<String> {
     let slash_pos = path.find('/')?;
     let file = &path[slash_pos + 1..]; // "25673dccc82356e_c.webp"
     let hash = file.split('_').next()?; // "25673dccc82356e"
+    poster_hash_to_wsrv(hash)
+}
+
+/// Build the wsrv.nl-proxied medium-size WebP URL for a bare poster hash as
+/// returned by the API's `poster` field.
+fn poster_hash_to_wsrv(hash: &str) -> Option<String> {
     if hash.len() < 2 {
         return None;
     }
