@@ -1,6 +1,9 @@
 [package]
 name = "dissimkl"
-version = "0.1.0"
+# Never a release number: the git tag is the authoritative version, stamped in
+# by build.rs. This only seeds the string dev builds report, so it cannot drift
+# out of sync with what has actually been released.
+version = "0.0.0-dev"
 edition = "2021"
 description = "Discord Rich Presence for Simkl"
 authors = []

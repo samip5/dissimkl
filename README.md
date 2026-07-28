@@ -153,12 +153,15 @@ where it came from:
 | Build | Reported version |
 |-------|------------------|
 | Release workflow on tag `v1.2.3` | `1.2.3` |
-| Anything else (`main`, local, `workflow_dispatch`) | `0.1.0-dev+g2cd0b57` |
+| Anything else (`main`, local, `workflow_dispatch`) | `0.0.0-dev+g2ff738d` |
 
-The git tag is the authoritative release version — `Cargo.toml`'s number only
-seeds the dev string, and a locally modified tree gets a `.dirty` suffix. Tag
-builds verify the stamp matches the tag before publishing, so a release can't
-ship a binary that disagrees with its tag.
+The git tag is the authoritative release version. `Cargo.toml` stays at
+`0.0.0-dev` and is never bumped — it only seeds the dev string, so it cannot
+drift out of sync with what has actually been released, and every dev build
+sorts below every release. A locally modified tree gets a `.dirty` suffix.
+
+Tag builds verify the stamp matches the tag before publishing, so a release
+can't ship a binary that disagrees with its tag.
 
 ---
 

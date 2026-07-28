@@ -1,9 +1,9 @@
 //! Derives the version string the binary reports, exposed as `DISSIMKL_VERSION`.
 //!
 //! A release build is stamped with the tag CI is building, which makes the tag
-//! the single authoritative version — `Cargo.toml`'s number only seeds dev
-//! builds. Everything else is stamped with the commit it came from, so a binary
-//! built from `main` can never be mistaken for a release.
+//! the single authoritative version — `Cargo.toml` stays at `0.0.0-dev` and only
+//! seeds dev builds. Everything else is stamped with the commit it came from, so
+//! a binary built from `main` can never be mistaken for a release.
 //!
 //! Deriving this here rather than rewriting `Cargo.toml` in the workflow keeps
 //! `cargo build --locked` usable: the lockfile pins the package's own version,
@@ -33,18 +33,31 @@ fn release_version() -> Option<String> {
     (!tag.is_empty()).then(|| tag.to_string())
 }
 
-/// `<manifest version>-dev+g<short sha>[.dirty]`, e.g. `0.1.0-dev+g2cd0b57`.
+/// `<manifest version>+g<short sha>[.dirty]`, e.g. `0.0.0-dev+g2cd0b57`.
 ///
 /// The commit is dropped when there is nothing to read it from (a source
-/// tarball with no checkout), leaving a bare `-dev` rather than failing the
-/// build over a cosmetic string.
+/// tarball with no checkout), leaving the bare manifest version rather than
+/// failing the build over a cosmetic string.
 fn dev_version() -> String {
-    let base = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let base = dev_base();
     let Some(sha) = short_sha() else {
-        return format!("{base}-dev");
+        return base;
     };
     let dirty = if is_dirty() { ".dirty" } else { "" };
-    format!("{base}-dev+g{sha}{dirty}")
+    format!("{base}+g{sha}{dirty}")
+}
+
+/// The manifest version, which carries its own `-dev` pre-release tag.
+///
+/// One is appended if it ever loses it, so that "a dev build never reports a
+/// bare release number" holds no matter what the manifest says.
+fn dev_base() -> String {
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    if version.contains('-') {
+        version
+    } else {
+        format!("{version}-dev")
+    }
 }
 
 fn short_sha() -> Option<String> {

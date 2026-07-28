@@ -25,7 +25,7 @@ use crate::utils::{interactive_setup, load_config, Config};
 // ---------------------------------------------------------------------------
 
 /// Version this binary was built at, derived by `build.rs`: the release tag for
-/// a tagged CI build, otherwise `<manifest version>-dev+g<commit>`.
+/// a tagged CI build, otherwise `0.0.0-dev+g<commit>`.
 const VERSION: &str = env!("DISSIMKL_VERSION");
 
 fn main() -> Result<()> {
