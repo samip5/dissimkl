@@ -24,13 +24,24 @@ use crate::utils::{interactive_setup, load_config, Config};
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Version this binary was built at, derived by `build.rs`: the release tag for
+/// a tagged CI build, otherwise `<manifest version>-dev+g<commit>`.
+const VERSION: &str = env!("DISSIMKL_VERSION");
+
 fn main() -> Result<()> {
+    // Answer --version before touching config or the network; it is the only
+    // argument the binary takes.
+    if std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V") {
+        println!("dissimkl {}", VERSION);
+        return Ok(());
+    }
+
     // Initialise tracing (RUST_LOG controls verbosity, defaults to "info").
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("dissimkl=info,warn"));
     fmt().with_env_filter(filter).with_target(false).init();
 
-    info!("dissimkl starting");
+    info!("dissimkl {} starting", VERSION);
 
     // Load or create config.
     let config = match load_config() {

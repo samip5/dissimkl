@@ -141,6 +141,27 @@ RUST_LOG=warn ./dissimkl             # errors/warnings only
 
 ---
 
+## Versioning
+
+```sh
+./dissimkl --version
+```
+
+The version is stamped at build time by `build.rs`, so a binary always reports
+where it came from:
+
+| Build | Reported version |
+|-------|------------------|
+| Release workflow on tag `v1.2.3` | `1.2.3` |
+| Anything else (`main`, local, `workflow_dispatch`) | `0.1.0-dev+g2cd0b57` |
+
+The git tag is the authoritative release version — `Cargo.toml`'s number only
+seeds the dev string, and a locally modified tree gets a `.dirty` suffix. Tag
+builds verify the stamp matches the tag before publishing, so a release can't
+ship a binary that disagrees with its tag.
+
+---
+
 ## License
 
 MIT

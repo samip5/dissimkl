@@ -49,8 +49,35 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # A tag build is stamped with the tag; a workflow_dispatch run off a
+      # branch passes an empty string, which build.rs treats as "not a release"
+      # and stamps with the commit instead.
       - name: Build
+        env:
+          DISSIMKL_RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Every target in the matrix builds natively, so the fresh binary can be
+      # asked what version it thinks it is. --version returns before any config
+      # or tray setup, so this is safe on a headless runner.
+      - name: Verify stamped version
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/dissimkl"
+          # Not `[ … ] && bin=…`: a false test would be the step's last exit
+          # status and `bash -e` would abort the job on every non-Windows runner.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            bin="$bin.exe"
+          fi
+          stamped="$("$bin" --version)"
+          echo "$stamped"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            expected="dissimkl ${GITHUB_REF_NAME#v}"
+            if [ "$stamped" != "$expected" ]; then
+              echo "::error::expected '$expected', got '$stamped'"
+              exit 1
+            fi
+          fi
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
